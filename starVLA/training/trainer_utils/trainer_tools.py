@@ -18,6 +18,32 @@ from accelerate.logging import get_logger
 logger = get_logger(__name__)
 
 
+# Frameworks return their losses and their log-only diagnostics in one dict. Keys with this prefix
+# are reported but never summed into the backward pass. METRIC_PREFIX and split_loss_terms are
+# ported ahead of the rest of VLA-JEPA's trainer_tools additions (the four grad-diagnostic
+# helpers, deferred to the training-entrypoint port) because they are trivial, self-contained, and
+# VLA_JEPA.py's own forward()/_loss_metrics() output cannot be correctly consumed without them.
+METRIC_PREFIX = "metric/"
+
+
+def split_loss_terms(output_dict):
+    """Split a framework output into optimized losses and log-only metrics.
+
+    Args:
+        output_dict: mapping name -> scalar tensor, as returned by a framework's forward().
+
+    Returns:
+        (losses, metrics): the terms to sum for backward, and the METRIC_PREFIX ones to log.
+    """
+    losses, metrics = {}, {}
+    for name, value in output_dict.items():
+        if name.startswith(METRIC_PREFIX):
+            metrics[name] = value
+        else:
+            losses[name] = value
+    return losses, metrics
+
+
 def _dist_rank() -> int:
     return dist.get_rank() if dist.is_initialized() else 0
 
