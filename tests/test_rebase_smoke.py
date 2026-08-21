@@ -27,7 +27,9 @@ from parity_probe import (
     NUM_VIEWS,
     PUBLISHED_LIBERO_CKPT,
     SEED,
+    SHORT_RUN_STEPS,
     make_examples,
+    probe_short_run,
     seeded_forward,
     split_losses,
 )
@@ -230,3 +232,39 @@ def test_published_checkpoint_load_is_reported_not_assumed(model):
         f"mismatched={len(mismatched)} (not a gate -- D-056 does not require checkpoint compat)"
     )
     del checkpoint
+
+
+# --------------------------------------------------------------------------------------
+# short real training run (scoping doc §5) -- single-process AdamW steps on a synthetic batch,
+# via parity_probe.probe_short_run, mirroring train_starvla.py::_train_step's optimization
+# semantics without needing accelerate/DeepSpeed process-group setup or a real dataset on disk.
+# Not required to match the pre-rebase lineage's numbers (D-056) -- only non-degenerate.
+# --------------------------------------------------------------------------------------
+
+
+def test_short_training_run_is_non_degenerate(model, cfg):
+    model.train()
+    try:
+        result = probe_short_run(model, cfg)
+    finally:
+        model.eval()
+
+    assert result["optimizer_steps"] == SHORT_RUN_STEPS
+    assert result["scheduler_last_epoch"] == SHORT_RUN_STEPS
+    losses_by_step = [
+        {name: float.fromhex(value) for name, value in step["losses"].items()} for step in result["step_losses"]
+    ]
+    for step_idx, losses in enumerate(losses_by_step):
+        for name, value in losses.items():
+            assert value == value and abs(value) != float("inf"), f"step {step_idx} {name} not finite: {value}"
+
+    teacher = result["modules"].get("vj_encoder")
+    assert teacher is not None
+    grads = [n for n, p in model.vj_encoder.named_parameters() if p.grad is not None]
+    assert grads == [], f"gradient reached the frozen teacher after training steps: {grads[:5]}"
+
+    print(
+        f"\n[short_run] {SHORT_RUN_STEPS} optimizer steps, last_lr={result['last_lr']}, "
+        f"action_loss@0={losses_by_step[0].get('action_loss')}, "
+        f"action_loss@last={losses_by_step[-1].get('action_loss')}"
+    )

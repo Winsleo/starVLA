@@ -1,9 +1,11 @@
 import json
 import os
 from accelerate.logging import get_logger
+from functools import partial
 import numpy as np
 from torch.utils.data import DataLoader
 import numpy as np
+import torch
 import torch.distributed as dist
 from pathlib import Path
 from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
@@ -67,5 +69,38 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
     elif dataset_py == "vlm_datasets":
         vlm_data_module = make_vlm_dataloader(cfg)
         vlm_train_dataloader = vlm_data_module["train_dataloader"]
-        
+
         return vlm_train_dataloader
+    elif dataset_py == "video_datasets":
+        # VLA-JEPA-only dataset (action-free video pretraining/cotraining), no upstream
+        # equivalent -- ported verbatim from VLA-JEPA's dataloader/__init__.py rather than
+        # reconciled, since there is nothing upstream to reconcile against (see
+        # docs/plans/upstream-rebase-experiment.md §2.5).
+        from starVLA.dataloader.video_datasets import VideoFolderDataset, collate_fn
+
+        video_dataset_cfg = cfg.datasets.video_data
+
+        video_dataset = VideoFolderDataset(
+            video_dir=video_dataset_cfg.video_dir,
+            text_file=video_dataset_cfg.text_file,
+            n_frames=cfg.framework.vj2_model.num_frames,
+            extensions=tuple(video_dataset_cfg.extensions),
+            crop_h_size=video_dataset_cfg.video_resolution_size,
+            crop_w_size=video_dataset_cfg.video_resolution_size,
+            max_retry=10,
+        )
+
+        video_collate_fn = partial(collate_fn,
+            n_views=2,
+            resolution_size=video_dataset_cfg.resolution_size)
+
+        train_sampler = torch.utils.data.distributed.DistributedSampler(video_dataset, shuffle=True)
+
+        video_train_dataloader = DataLoader(
+            video_dataset,
+            batch_size=video_dataset_cfg.per_device_batch_size,
+            collate_fn=video_collate_fn,
+            num_workers=16,
+            sampler=train_sampler,
+        )
+        return video_train_dataloader
