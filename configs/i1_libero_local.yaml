@@ -75,7 +75,11 @@ framework:
   reduce_in_full_precision: true
 datasets:
   vla_data:
-    dataset_py: lerobot_datasets
+    # jepa_lerobot_datasets (not upstream's lerobot_datasets): the latter's shared _pack_sample
+    # only keeps a single frame regardless of DataConfig delta_indices, so it cannot produce the
+    # multi-frame `video` clip VLA_JEPA.forward() needs. See dataloader/jepa_lerobot_datasets.py
+    # and docs/plans/upstream-rebase-experiment.md, "Needs a decision" #3 (resolved via option b).
+    dataset_py: jepa_lerobot_datasets
     data_root_dir: /vepfs/wangshilong/data/dynaweave/LEROBOT_LIBERO_DATA
     data_mix: libero_all
     action_type: delta_qpos
@@ -88,6 +92,9 @@ datasets:
     with_state: true
     depth_cache_root: null
     depth_state_cache_root: null
+    # decord fails on every LIBERO video in this env's decord install (unrelated to this port);
+    # pyav is confirmed working. Site-specific environment detail, not a code fix.
+    video_backend: pyav
     depth_cache_estimator: DA3METRIC-LARGE
 trainer:
   epochs: 100
