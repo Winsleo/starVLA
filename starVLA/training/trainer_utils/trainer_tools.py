@@ -150,6 +150,15 @@ def build_param_lr_groups(model, cfg):
             print(f"⚠️ freeze module path does not exist: {freeze_path}")
             continue
 
+    # Modules frozen in code rather than by config (the V-JEPA teacher, see VJBackboneAdapter)
+    # must stay out of the optimizer too: ZeRO otherwise allocates gradient buffers for them and
+    # weight decay would keep updating parameters that receive no gradient. Ported from
+    # VLA-JEPA's own trainer_tools.py -- upstream's rewrite of this function dropped it; found via
+    # docs/plans/upstream-rebase-experiment.md's matched-condition comparison (measured directly:
+    # the frozen vj_encoder's 587 tensors / 326M params were landing in the "base" group without
+    # this line).
+    frozen_params.update(id(p) for p in model.parameters() if not p.requires_grad)
+
     for module_name, lr in lr_cfg.items():
         if module_name == "base":
             continue

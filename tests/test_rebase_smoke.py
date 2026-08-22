@@ -268,3 +268,22 @@ def test_short_training_run_is_non_degenerate(model, cfg):
         f"action_loss@0={losses_by_step[0].get('action_loss')}, "
         f"action_loss@last={losses_by_step[-1].get('action_loss')}"
     )
+
+
+# --------------------------------------------------------------------------------------
+# frozen teacher must stay out of the optimizer entirely, not just receive no gradient
+# (docs/plans/upstream-rebase-experiment.md's matched-condition comparison found upstream's
+# rewrite of trainer_tools.py dropped VLA-JEPA's explicit exclusion of requires_grad=False params
+# from every LR group -- under DeepSpeed ZeRO this risks weight-decay drift on a param with no
+# gradient, not just a wasted no-op the way it is under plain torch.optim.AdamW).
+# --------------------------------------------------------------------------------------
+
+
+def test_frozen_teacher_excluded_from_every_optimizer_group(model, cfg):
+    from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
+
+    groups = build_param_lr_groups(model=model, cfg=cfg)
+    teacher_ids = {id(p) for p in model.vj_encoder.parameters()}
+    for group in groups:
+        hit = [p for p in group["params"] if id(p) in teacher_ids]
+        assert not hit, f"{len(hit)} frozen vj_encoder tensors leaked into optimizer group {group['name']!r}"
