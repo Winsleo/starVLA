@@ -156,6 +156,9 @@ class VLATrainer(TrainerUtils):
         self.accelerator = accelerator
         self.writer = SummaryWriter(log_dir=os.path.join(cfg.run_root_dir, cfg.run_id, "tensorboard"))  # 保存目录
 
+        # Initialize JSON log file for loss tracking
+        self.json_log_path = os.path.join(cfg.run_root_dir, cfg.run_id, "training_metrics.jsonl")
+
         # training status tracking
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
@@ -264,6 +267,16 @@ class VLATrainer(TrainerUtils):
                 #wandb.log(metrics, step=self.completed_steps)
                 # debug output
                 logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+
+                # Write to JSON log file for reliable metric tracking
+                if self.accelerator.is_local_main_process:
+                    log_entry = {
+                        "step": self.completed_steps,
+                        "metrics": {k: float(v) if isinstance(v, (int, float, np.number)) else v
+                                   for k, v in metrics.items()}
+                    }
+                    with open(self.json_log_path, "a") as f:
+                        f.write(json.dumps(log_entry) + "\n")
 
     def _create_data_iterators(self):
         """create data iterators"""
