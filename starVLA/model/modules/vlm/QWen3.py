@@ -111,10 +111,20 @@ class _QWen3_VL_Interface(nn.Module):
             )
         return generation_output
 
-    def build_qwenvl_inputs(self, images, instructions, solutions=None, **kwargs):
+    def build_qwenvl_inputs(
+        self, images, instructions, solutions=None, prompt_replace_dict=None, prompt_template=None, **kwargs
+    ):
         """
         Build model inputs from raw data (images + instructions + optional solutions).
         Follow Oficial Qwen3-VL Instruct format: https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct
+
+        `prompt_template`/`prompt_replace_dict` let a caller (e.g. VLA_JEPA.forward()) inject
+        placeholder tokens -- such as action/embodied-action conditioning tokens -- into the
+        prompt text before tokenization. Without them the caller's placeholders (e.g. "{actions}")
+        are silently absorbed into **kwargs and left unsubstituted in the prompt, so no
+        corresponding token ever reaches build_qwenvl_inputs's output, and any code that later
+        selects those tokens out of the hidden states (e.g. by scanning input_ids for an
+        action-token id) finds nothing.
         """
 
         # Create messages: one message per sample
@@ -123,11 +133,20 @@ class _QWen3_VL_Interface(nn.Module):
         for imgs, instruction in zip(images, instructions):
             content = [{"type": "image", "image": img} for img in imgs]
 
-            if "CoT_prompt" in self.config.datasets.vla_data:  # If using a grounding prompt to task
-                CoT_prompt = self.config.datasets.vla_data.get("CoT_prompt", "")
-                prompt = CoT_prompt.replace("{instruction}", instruction)
+            if prompt_template is None:
+                if "CoT_prompt" in self.config.datasets.vla_data:  # If using a grounding prompt to task
+                    CoT_prompt = self.config.datasets.vla_data.get("CoT_prompt", "")
+                    prompt = CoT_prompt.replace("{instruction}", instruction)
+                    if prompt_replace_dict is not None:
+                        for k, v in prompt_replace_dict.items():
+                            prompt = prompt.replace(k, v)
+                else:
+                    prompt = instruction
             else:
-                prompt = instruction
+                prompt = prompt_template.replace("{instruction}", instruction)
+                if prompt_replace_dict is not None:
+                    for k, v in prompt_replace_dict.items():
+                        prompt = prompt.replace(k, v)
 
             content.append({"type": "text", "text": prompt})
             msg = [{"role": "user", "content": content}]

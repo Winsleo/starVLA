@@ -102,6 +102,38 @@ def test_action_free_batch_masks_only_action_loss(model, cfg):
     assert torch.isfinite(out["wm_loss"])
 
 
+def test_action_conditioning_tokens_reach_the_qwen_sequence(model, cfg):
+    """VLA_JEPA.forward() injects action/embodied-action placeholder tokens into the Qwen prompt
+    via build_qwenvl_inputs(prompt_template=..., prompt_replace_dict=...). The ported
+    starVLA/model/modules/vlm/QWen3.py originally did not accept those kwargs -- they were
+    silently absorbed by **kwargs and never used, so the placeholders stayed as literal text
+    ("{actions}"/"{e_actions}") and action_indices/embodied_action_indices matched nothing,
+    leaving vj_predictor's and the action head's conditioning empty. Found via
+    docs/plans/upstream-rebase-experiment.md's matched-condition comparison (measured directly:
+    input_ids length 174 vs. the original tree's 226 for an identical batch).
+    """
+    examples = make_examples(cfg, video_seed=1)
+    orig_fn = model.qwen_vl_interface.build_qwenvl_inputs
+    captured = {}
+
+    def wrapped(*args, **kwargs):
+        out = orig_fn(*args, **kwargs)
+        captured["input_ids"] = out["input_ids"]
+        return out
+
+    model.qwen_vl_interface.build_qwenvl_inputs = wrapped
+    try:
+        seeded_forward(model, examples)
+    finally:
+        model.qwen_vl_interface.build_qwenvl_inputs = orig_fn
+
+    input_ids = captured["input_ids"]
+    action_hits = torch.isin(input_ids, torch.tensor(model.action_token_ids, device=input_ids.device))
+    embodied_hits = torch.isin(input_ids, torch.tensor([model.embodied_action_token_id], device=input_ids.device))
+    assert action_hits.any(), "no action-conditioning token reached the Qwen sequence"
+    assert embodied_hits.any(), "no embodied-action-conditioning token reached the Qwen sequence"
+
+
 # --------------------------------------------------------------------------------------
 # determinism
 # --------------------------------------------------------------------------------------
