@@ -457,9 +457,10 @@ class VLA_JEPA(baseframework):
     @torch.inference_mode()
     def predict_action(
         self,
-        batch_images: List[List[Image.Image]],  # Batch of PIL Image list as [view1, view2]
-        instructions: List[str],
+        batch_images: Optional[List[List[Image.Image]]] = None,  # Batch of views [view1, view2]
+        instructions: Optional[List[str]] = None,
         state: Optional[np.ndarray] = None,
+        examples: Optional[List[dict]] = None,
         **kwargs: str,
     ) -> np.ndarray:
         """
@@ -471,8 +472,12 @@ class VLA_JEPA(baseframework):
           6. Return normalized action trajectory
 
         Args:
-            batch_images: List of samples; each sample is List[PIL.Image] (multi-view).
-            instructions: List[str] natural language task instructions.
+            batch_images: Legacy list of samples; each sample is a multi-view image list.
+            instructions: Legacy batch of natural-language task instructions.
+            state: Legacy batch of proprioceptive states.
+            examples: Current framework schema. Each item supplies ``image``, ``lang``,
+                and optionally ``state``. It is normalized to the legacy inference
+                inputs here so both server protocols execute the same policy path.
             cfg_scale: >1 enables classifier-free guidance (scales conditional vs unconditional).
             use_ddim: Whether to use DDIM deterministic sampling.
             num_ddim_steps: Number of DDIM steps if enabled.
@@ -482,6 +487,22 @@ class VLA_JEPA(baseframework):
             dict:
                 normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
         """
+        if examples is not None:
+            if batch_images is not None or instructions is not None or state is not None:
+                raise ValueError("Pass either examples or legacy inference inputs, not both")
+            if not examples:
+                raise ValueError("examples must contain at least one observation")
+            batch_images = [example["image"] for example in examples]
+            instructions = [example["lang"] for example in examples]
+            example_states = [example.get("state") for example in examples]
+            if any(item is not None for item in example_states):
+                if any(item is None for item in example_states):
+                    raise ValueError("state must be present for every example when provided")
+                state = example_states
+
+        if batch_images is None or instructions is None:
+            raise ValueError("batch_images and instructions are required for policy inference")
+
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
