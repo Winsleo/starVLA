@@ -90,9 +90,11 @@ class _CosmoPredict2_Interface(nn.Module):
         self.vae_scale_factor_temporal = 2 ** sum(self.vae.temperal_downsample)
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
-        # Freeze VAE and text encoder by default
-        self.vae.requires_grad_(False)
-        self.text_encoder.requires_grad_(False)
+        # The VAE and the text encoder are frozen target/condition encoders (AGENTS.md 6).
+        # requires_grad=False alone is not the whole invariant: eval mode has to survive the
+        # parent model's train(), which is what enforce_frozen() plus the train() override below
+        # provide. See the same fix in Wan2.py for the measured consequence of missing it.
+        self.enforce_frozen()
 
         # Expose config compatible with framework expectations
         # DiT: 16 heads × 128 dim = 2048
@@ -113,6 +115,19 @@ class _CosmoPredict2_Interface(nn.Module):
         extract_layers = wm_cfg.get("extract_layers", [-1])
         self._extract_layers = extract_layers
         self._register_hooks()
+
+    def enforce_frozen(self) -> None:
+        """Re-assert the firewall. Called again after every `train()` on the parent model."""
+        self.vae.requires_grad_(False)
+        self.vae.eval()
+        self.text_encoder.requires_grad_(False)
+        self.text_encoder.eval()
+
+    def train(self, mode: bool = True):
+        """Keep the frozen VAE and text encoder in eval mode when the parent switches to train."""
+        super().train(mode)
+        self.enforce_frozen()
+        return self
 
     @property
     def model(self):
