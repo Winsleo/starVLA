@@ -101,9 +101,18 @@ class _Wan2_Interface(nn.Module):
         self.vae_scale_factor_temporal = 2 ** sum(self.vae.temperal_downsample)
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
-        # # Freeze VAE and text encoder by default
-        # self.vae.requires_grad_(False)
-        # self.text_encoder.requires_grad_(False)
+        # The VAE and the text encoder are frozen target/condition encoders (AGENTS.md 6).
+        # Freezing at module level, not only at the call sites that happen to wrap their use in
+        # no_grad(), buys two things the call sites cannot:
+        #   1. they stay out of the optimizer -- build_param_lr_groups (see
+        #      training/trainer_utils/trainer_tools.py) excludes params with requires_grad=False,
+        #      and without that exclusion ZeRO allocates gradient buffers for them while weight
+        #      decay keeps updating weights that receive no gradient, so a "frozen" tokenizer
+        #      silently drifts;
+        #   2. the guarantee survives new call sites, including target encoding and
+        #      decode-for-eval, where a missing no_grad() would let gradient reach the target
+        #      and make latent-space collapse a valid way to lower the loss.
+        self.enforce_frozen()
 
         # DiT: 24 heads × 128 dim = 3072
         self._hidden_size = (
@@ -125,6 +134,19 @@ class _Wan2_Interface(nn.Module):
         extract_layers = wm_cfg.get("extract_layers", [-1])
         self._extract_layers = extract_layers
         self._register_hooks()
+
+    def enforce_frozen(self) -> None:
+        """Re-assert the firewall. Called again after every `train()` on the parent model."""
+        self.vae.requires_grad_(False)
+        self.vae.eval()
+        self.text_encoder.requires_grad_(False)
+        self.text_encoder.eval()
+
+    def train(self, mode: bool = True):
+        """Keep the frozen VAE and text encoder in eval mode when the parent switches to train."""
+        super().train(mode)
+        self.enforce_frozen()
+        return self
 
     @property
     def model(self):
