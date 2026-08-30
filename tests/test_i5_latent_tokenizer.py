@@ -73,6 +73,11 @@ class _StubOutput:
         self.latent_dist = _StubDist(mean)
 
 
+class _StubDecoded:
+    def __init__(self, sample: torch.Tensor) -> None:
+        self.sample = sample
+
+
 class _StubVAE(nn.Module):
     """Causal stand-in: latent frame k is the mean of raw frames 0..4k, so the dependency
     structure the real VAE was measured to have is reproduced exactly."""
@@ -94,6 +99,19 @@ class _StubVAE(nn.Module):
         for k in range(latent_frame_count(video.shape[2])):
             frames.append(pooled[:, :, : 4 * k + 1].mean(dim=2))
         return _StubOutput(torch.stack(frames, dim=2))
+
+    def decode(self, latents: torch.Tensor) -> "_StubDecoded":
+        """Back to the raw layout the encoder consumes: [B, 3, T, H, W] in [-1, 1].
+
+        Derived from the latents rather than a constant, so a decode test cannot pass vacuously.
+        """
+        b, _, t, h, w = latents.shape
+        per_frame = latents.mean(dim=1, keepdim=True).clamp(-1.0, 1.0)  # [B, 1, t, h, w]
+        video = per_frame.repeat_interleave(4, dim=2)[:, :, : 4 * (t - 1) + 1]
+        video = video.expand(-1, 3, -1, -1, -1)
+        return _StubDecoded(torch.nn.functional.interpolate(
+            video, size=(video.shape[2], h * 16, w * 16), mode="nearest"
+        ))
 
 
 def _clip(num_frames: int = I5_WINDOW_FRAMES, size: int = 32, seed: int = 0) -> np.ndarray:
@@ -226,6 +244,18 @@ class FrozenLatentTokenizerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"\[B, T, H, W, 3\]"):
             self.tokenizer.encode_windows(_clip())
 
+    def test_decode_returns_uint8_frames_in_the_encoder_layout(self):
+        latents = self.tokenizer.encode(_clip(size=32))
+        frames = self.tokenizer.decode(latents)
+        self.assertEqual(frames.dtype, torch.uint8)
+        self.assertEqual(tuple(frames.shape), (1, I5_WINDOW_FRAMES, 32, 32, 3))
+        self.assertGreaterEqual(int(frames.min()), 0)
+        self.assertLessEqual(int(frames.max()), 255)
+
+    def test_decode_rejects_the_wrong_channel_count(self):
+        with self.assertRaisesRegex(ValueError, "latent channels"):
+            self.tokenizer.decode(torch.zeros(1, 7, 3, 2, 2))
+
     def test_normalisation_is_applied_by_default(self):
         clip = _clip()
         raw = self.tokenizer.encode(clip, normalize=False)
@@ -257,6 +287,19 @@ class RealWanVaeTest(unittest.TestCase):
                 torch.equal(latents[:, :, 0], base[:, :, 0]),
                 f"raw frame {index} changed latent frame 0",
             )
+
+    def test_decode_round_trip_shape_on_real_weights(self):
+        """Shape and dtype of a real encode-decode round trip.
+
+        This does **not** pin reconstruction quality: the clip here is random noise, on which any
+        MAE bound would be meaningless. The tokenizer's reconstruction ceiling was measured
+        separately on a real LIBERO clip (MAE 1.42/255, PSNR 38.04 dB) and is recorded in
+        docs/plans/i5-generative-baseline.md, not asserted here.
+        """
+        clip = _clip(size=64)
+        frames = self.tokenizer.decode(self.tokenizer.encode(clip))
+        self.assertEqual(tuple(frames.shape), (1, I5_WINDOW_FRAMES, 64, 64, 3))
+        self.assertEqual(frames.dtype, torch.uint8)
 
     def test_encode_is_bit_identical_across_calls(self):
         clip = _clip(size=64)

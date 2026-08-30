@@ -189,6 +189,31 @@ class FrozenLatentTokenizer(nn.Module):
         """
         return self._encode_video(frames_to_vae_input(frames), normalize=normalize)
 
+    @torch.no_grad()
+    def decode(self, latents: torch.Tensor, *, normalized: bool = True) -> torch.Tensor:
+        """Normalised latents `[B, C, T_lat, h, w]` -> `[B, T, H, W, 3]` uint8 frames.
+
+        The inverse of :meth:`encode`, needed by the perceptual metrics: nothing in the tree called
+        `vae.decode` before I5. Frames come back as uint8 in the same layout the encoder takes, so a
+        round trip is directly comparable against the input clip.
+        """
+        if latents.ndim != 5:
+            raise ValueError(f"expected [B, C, T_lat, h, w], got {tuple(latents.shape)}")
+        if latents.shape[1] != self.latent_channels:
+            raise ValueError(
+                f"expected {self.latent_channels} latent channels, got {latents.shape[1]}"
+            )
+        device, dtype = next(self.vae.parameters()).device, self.vae.dtype
+        latents = latents.to(device, dtype)
+        if normalized:
+            view = (1, -1, 1, 1, 1)
+            mean = self.latents_mean.to(device, dtype).view(view)
+            std = self.latents_std.to(device, dtype).view(view)
+            latents = latents * std + mean
+        video = self.vae.decode(latents).sample  # [B, 3, T, H, W] in roughly [-1, 1]
+        frames = video.permute(0, 2, 3, 4, 1).to(torch.float32)
+        return frames.add_(1.0).mul_(127.5).clamp_(0, 255).round_().to(torch.uint8)
+
     def _encode_video(self, video: torch.Tensor, *, normalize: bool) -> torch.Tensor:
         video = video.to(next(self.vae.parameters()).device, self.vae.dtype)
         latents = self.vae.encode(video).latent_dist.mode()
