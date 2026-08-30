@@ -87,6 +87,24 @@ def decode_episode(path: Path, expected_frames: int) -> np.ndarray:
     return np.stack(frames)
 
 
+def episode_video_path(suite_dir: Path, info: dict, view: str, episode: int) -> Path:
+    """Resolve one episode's video through the dataset's own `video_path` template.
+
+    Not reconstructed by hand: the chunk index is `episode_index // chunks_size`, and hardcoding
+    `chunk-000` is only correct while every suite stays under one chunk. Upstream fixed exactly that
+    class of bug in `get_video_path` (starVLA #359), and the trainer's own dataset reads the template
+    from `info.json` (`_get_video_path_pattern`), so this follows the same source of truth.
+    """
+    template = info.get("video_path")
+    if not template:
+        raise SystemExit(f"{suite_dir.name}: info.json has no video_path template")
+    chunk_size = int(info.get("chunks_size", 1000))
+    relative = template.format(
+        episode_chunk=episode // chunk_size, video_key=view, episode_index=episode
+    )
+    return suite_dir / relative
+
+
 def window_starts(length: int, window: int, stride: int) -> list[int]:
     return list(range(0, max(0, length - window + 1), stride))
 
@@ -142,7 +160,7 @@ def main() -> None:
 
     for suite in suites:
         suite_dir = args.data_root / suite
-        _, episodes = read_suite_meta(suite_dir, args.view)
+        info, episodes = read_suite_meta(suite_dir, args.view)
         if subset:
             episodes = episodes[: args.limit_episodes]
         by_task: dict[str, list[int]] = {}
@@ -175,7 +193,7 @@ def main() -> None:
                 records.append(entry)
                 continue
 
-            video = suite_dir / "videos" / "chunk-000" / args.view / f"episode_{episode:06d}.mp4"
+            video = episode_video_path(suite_dir, info, args.view, episode)
             frames = decode_episode(video, length)
             latents = encode_episode(tokenizer, frames, starts, args.window, args.batch_size)
             latent_shape = list(latents.shape[1:])
