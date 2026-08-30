@@ -46,6 +46,18 @@ LATENT_CHANNELS = 48
 I5_WINDOW_FRAMES = 9
 
 
+def shard_of(position: int, shard_count: int) -> int:
+    """Which shard encodes the `position`-th episode of a build.
+
+    Round-robin rather than contiguous blocks: episode lengths vary by a factor of a few, and
+    `libero_10` episodes are about twice the corpus average, so contiguous blocks would leave one
+    worker running long after the others finished.
+    """
+    if shard_count < 1:
+        raise ValueError(f"shard_count must be >= 1, got {shard_count}")
+    return position % shard_count
+
+
 def latent_frame_count(num_frames: int) -> int:
     """Latent frames the VAE emits for `num_frames` raw frames."""
     if num_frames < 1:

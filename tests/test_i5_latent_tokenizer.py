@@ -41,6 +41,7 @@ from starVLA.model.modules.world_model.latent_tokenizer import (
     is_aligned_window,
     latent_frame_count,
     normalize_latents,
+    shard_of,
 )
 
 
@@ -260,6 +261,22 @@ class RealWanVaeTest(unittest.TestCase):
     def test_encode_is_bit_identical_across_calls(self):
         clip = _clip(size=64)
         self.assertTrue(torch.equal(self.tokenizer.encode(clip), self.tokenizer.encode(clip)))
+
+
+class ShardingTest(unittest.TestCase):
+    def test_every_position_lands_in_exactly_one_shard(self):
+        for shard_count in (1, 3, 8):
+            owners = [shard_of(position, shard_count) for position in range(200)]
+            self.assertEqual(set(owners), set(range(shard_count)))
+            # Round-robin: consecutive episodes go to different workers, so the long episodes of
+            # libero_10 spread out instead of piling onto one shard.
+            for shard in range(shard_count):
+                count = owners.count(shard)
+                self.assertLessEqual(abs(count - 200 / shard_count), 1)
+
+    def test_shard_count_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "shard_count"):
+            shard_of(0, 0)
 
 
 class EpisodeSplitTest(unittest.TestCase):

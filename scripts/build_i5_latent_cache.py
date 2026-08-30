@@ -40,9 +40,11 @@ import torch
 from starVLA.dataloader.i5_episode_split import assign_splits, split_counts
 from starVLA.model.modules.world_model.latent_tokenizer import (
     I5_WINDOW_FRAMES,
+    LATENT_CHANNELS,
     FrozenLatentTokenizer,
     is_aligned_window,
     latent_frame_count,
+    shard_of,
 )
 
 DEFAULT_VIEW = "observation.images.image"
@@ -122,6 +124,45 @@ def encode_episode(
     return np.concatenate(chunks, axis=0)
 
 
+def check_contract(index: dict, *, require_complete: bool) -> None:
+    """Refuse to write an index that contradicts the I5 latent contract.
+
+    The process that declares a cache complete is the right place to enforce what "complete" means,
+    so a cluster job does not have to re-derive these assertions in shell. Structural checks always
+    run; coverage checks only when the caller asked for a full build.
+    """
+    problems: list[str] = []
+    if index["window"] != I5_WINDOW_FRAMES:
+        problems.append(f"window is {index['window']}, D-062 fixes it at {I5_WINDOW_FRAMES}")
+    if index["latent_frames"] != latent_frame_count(I5_WINDOW_FRAMES):
+        problems.append(f"latent_frames is {index['latent_frames']}, expected 3")
+    shape = index.get("latent_shape")
+    if shape is not None and shape[0] != LATENT_CHANNELS:
+        problems.append(f"latent channels {shape[0]}, expected {LATENT_CHANNELS}")
+    if shape is not None and tuple(shape[2:]) != (16, 16):
+        problems.append(f"latent grid {tuple(shape[2:])}, expected (16, 16) to match I3/I4 targets")
+    if index["posterior"] != "mode":
+        problems.append(f"posterior is {index['posterior']!r}; the cache must be reproducible")
+    if not index["normalized"]:
+        problems.append("latents are not normalised; the DiT input space would disagree")
+    if require_complete:
+        missing = index["num_encodable_episodes"] - index["num_cached_episodes"]
+        if missing:
+            problems.append(
+                f"{missing} of {index['num_encodable_episodes']} encodable episode(s) have no shard "
+                "on disk"
+            )
+        elif index["subset"]:
+            problems.append(
+                "this is a --limit-episodes subset build, so it can never be a complete cache"
+            )
+        empty = [name for name, count in index["split_episode_counts"].items() if count == 0]
+        if empty:
+            problems.append(f"split(s) {', '.join(empty)} are empty (D-064 requires all three)")
+    if problems:
+        raise SystemExit("latent cache contract violated:\n  - " + "\n  - ".join(problems))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=Path, required=True, help="LeRobot LIBERO conversion root")
@@ -135,7 +176,32 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--limit-episodes", type=int, default=0, help="per suite; 0 = all. Subset runs")
+    parser.add_argument(
+        "--shard-count", type=int, default=1, help="split the episode list across this many workers"
+    )
+    parser.add_argument("--shard-index", type=int, default=0, help="which shard this process encodes")
+    parser.add_argument(
+        "--index-only",
+        action="store_true",
+        help="write index.json from what is already on disk, without encoding anything",
+    )
+    parser.add_argument(
+        "--revision", default=None, help="submodule revision to stamp into the index for provenance"
+    )
+    parser.add_argument(
+        "--require-complete",
+        action="store_true",
+        help="fail unless every encodable episode is cached and every split is populated",
+    )
     args = parser.parse_args()
+
+    if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
+        raise SystemExit(f"bad shard {args.shard_index}/{args.shard_count}")
+    # Sharded workers write NPZ only; one --index-only pass afterwards writes the single index.json,
+    # so the artifact contract stays one index per cache no matter how many workers built it. The
+    # split assignment is computed from the full episode list in every process, so which shard
+    # encodes an episode never changes which split it lands in.
+    writes_index = args.index_only or args.shard_count == 1
 
     if not is_aligned_window(args.window):
         raise SystemExit(
@@ -149,14 +215,18 @@ def main() -> None:
     if not suites:
         raise SystemExit(f"no LeRobot suites under {args.data_root}")
 
-    tokenizer = FrozenLatentTokenizer.from_pretrained(args.vae_path, subfolder=args.vae_subfolder)
-    tokenizer = tokenizer.to(args.device)
-    tokenizer.enforce_frozen()
+    # The index pass reads metadata and file existence only, so it must not need 1.4 GB of weights.
+    tokenizer = None
+    if not args.index_only:
+        tokenizer = FrozenLatentTokenizer.from_pretrained(args.vae_path, subfolder=args.vae_subfolder)
+        tokenizer = tokenizer.to(args.device)
+        tokenizer.enforce_frozen()
 
     args.output.mkdir(parents=True, exist_ok=True)
     records: list[dict] = []
     subset = args.limit_episodes > 0
     latent_shape: list[int] | None = None
+    global_position = 0  # counts encodable episodes across suites, so sharding balances globally
 
     for suite in suites:
         suite_dir = args.data_root / suite
@@ -189,7 +259,12 @@ def main() -> None:
                 entry["skipped"] = f"episode shorter than the {args.window}-frame window"
                 records.append(entry)
                 continue
-            if destination.exists():
+            global_position += 1
+            entry["cached"] = destination.exists()
+            if entry["cached"] or args.index_only:
+                records.append(entry)
+                continue
+            if shard_of(global_position, args.shard_count) != args.shard_index:
                 records.append(entry)
                 continue
 
@@ -204,17 +279,29 @@ def main() -> None:
                 partial, latents=latents, window_starts=np.asarray(starts, dtype=np.int32)
             )
             partial.replace(destination)
+            entry["cached"] = True
             records.append(entry)
             if position % 25 == 0:
                 print(f"{suite}: {position}/{len(episodes)}", flush=True)
 
-    written = [r for r in records if not r.get("skipped")]
+    encodable = [r for r in records if not r.get("skipped")]
+    cached = [r for r in encodable if r.get("cached")]
+    if not writes_index:
+        print(
+            f"shard {args.shard_index}/{args.shard_count}: {len(cached)}/{len(encodable)} episode(s) "
+            "on disk; run --index-only afterwards to write index.json"
+        )
+        return
+
     index = {
-        "complete": not subset,
+        # Complete means every encodable episode has a shard on disk -- checked, not assumed from
+        # this process having finished.
+        "complete": len(cached) == len(encodable) and not subset,
         "subset": subset,
         "num_episodes": len(records),
-        "num_cached_episodes": len(written),
-        "num_windows": sum(r["num_windows"] for r in written),
+        "num_encodable_episodes": len(encodable),
+        "num_cached_episodes": len(cached),
+        "num_windows": sum(r["num_windows"] for r in cached),
         "split_episode_counts": split_counts({r["episode_index"]: r["split"] for r in records}),
         "suites": suites,
         "view": args.view,
@@ -228,8 +315,9 @@ def main() -> None:
         # Determinism is per configuration: the same batch size, device and dtype reproduce this
         # cache bit-for-bit, a different batch size shifts it by float32 epsilon (about 2e-6).
         "batch_size": args.batch_size,
+        "shard_count": args.shard_count,
         "device": args.device,
-        "compute_dtype": str(next(tokenizer.vae.parameters()).dtype),
+        "compute_dtype": str(next(tokenizer.vae.parameters()).dtype) if tokenizer else None,
         "vae_path": args.vae_path,
         "vae_subfolder": args.vae_subfolder,
         "split_rule": "80/10/10 interleaved by episode index within each task (D-064)",
@@ -241,11 +329,14 @@ def main() -> None:
             "optimistically. Condition-ablation comparisons are unaffected: their arms share one "
             "policy and one clip set."
         ),
+        "starVLA_rebase_revision": args.revision,
         "episodes": records,
     }
+    check_contract(index, require_complete=args.require_complete)
     (args.output / "index.json").write_text(json.dumps(index, indent=2, sort_keys=True) + "\n")
     print(
-        f"cached {len(written)} episode(s), {index['num_windows']} window(s), "
+        f"cached {len(cached)}/{len(encodable)} episode(s), {index['num_windows']} window(s), "
+        f"complete={index['complete']}, "
         f"splits {index['split_episode_counts']}"
     )
 
