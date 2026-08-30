@@ -286,7 +286,7 @@ class EpisodeSplitTest(unittest.TestCase):
         second = assign_splits(episodes_by_task)
         self.assertEqual(first, second)
 
-        counts = split_counts(first)
+        counts = split_counts(first.values())
         self.assertEqual(sum(counts.values()), 40 * 42)
         for task, episodes in episodes_by_task.items():
             per_task = {first[e] for e in episodes}
@@ -294,7 +294,7 @@ class EpisodeSplitTest(unittest.TestCase):
 
     def test_ratio_is_eighty_ten_ten(self):
         assignment = assign_splits({"t": list(range(100))})
-        counts = split_counts(assignment)
+        counts = split_counts(assignment.values())
         self.assertEqual(counts, {TRAIN: 80, VAL: 10, TEST: 10})
 
     def test_interleaved_not_contiguous(self):
@@ -308,7 +308,20 @@ class EpisodeSplitTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot populate"):
             assign_splits({"tiny": [0, 1, 2]})
         relaxed = assign_splits({"tiny": [0, 1, 2]}, require_all_splits=False)
-        self.assertEqual(split_counts(relaxed), {TRAIN: 3, VAL: 0, TEST: 0})
+        self.assertEqual(split_counts(relaxed.values()), {TRAIN: 3, VAL: 0, TEST: 0})
+
+    def test_counting_is_over_names_not_a_mapping(self):
+        """LeRobot restarts episode indices per suite, so counting a mapping keyed on them collapses.
+
+        The first full build reported 454 episodes across the splits instead of 1693 for exactly
+        this reason: four suites reuse the low episode indices, and a dict keyed on `episode_index`
+        kept only the last suite's value. Counting split names cannot express that.
+        """
+        names = ["train"] * 1389 + ["val"] * 154 + ["test"] * 150
+        self.assertEqual(split_counts(names), {TRAIN: 1389, VAL: 154, TEST: 150})
+        self.assertEqual(sum(split_counts(names).values()), 1693)
+        with self.assertRaisesRegex(ValueError, "unknown split"):
+            split_counts(["train", "holdout"])
 
     def test_duplicate_episode_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "more than one task"):

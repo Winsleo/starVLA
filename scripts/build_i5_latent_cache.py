@@ -137,10 +137,19 @@ def check_contract(index: dict, *, require_complete: bool) -> None:
     if index["latent_frames"] != latent_frame_count(I5_WINDOW_FRAMES):
         problems.append(f"latent_frames is {index['latent_frames']}, expected 3")
     shape = index.get("latent_shape")
-    if shape is not None and shape[0] != LATENT_CHANNELS:
-        problems.append(f"latent channels {shape[0]}, expected {LATENT_CHANNELS}")
-    if shape is not None and tuple(shape[2:]) != (16, 16):
-        problems.append(f"latent grid {tuple(shape[2:])}, expected (16, 16) to match I3/I4 targets")
+    if shape is None:
+        # Never skip this quietly. The first full build left the shape unset because an --index-only
+        # pass encodes nothing, and the [48, 3, 16, 16] assertion below silently did not run.
+        problems.append("latent_shape is unset, so the shape contract could not be checked")
+    else:
+        if shape[0] != LATENT_CHANNELS:
+            problems.append(f"latent channels {shape[0]}, expected {LATENT_CHANNELS}")
+        if shape[1] != latent_frame_count(index["window"]):
+            problems.append(f"latent frames {shape[1]}, expected {latent_frame_count(index['window'])}")
+        if tuple(shape[2:]) != (16, 16):
+            problems.append(
+                f"latent grid {tuple(shape[2:])}, expected (16, 16) to match the I3/I4 target grid"
+            )
     if index["posterior"] != "mode":
         problems.append(f"posterior is {index['posterior']!r}; the cache must be reproducible")
     if not index["normalized"]:
@@ -286,6 +295,11 @@ def main() -> None:
 
     encodable = [r for r in records if not r.get("skipped")]
     cached = [r for r in encodable if r.get("cached")]
+    if latent_shape is None and cached:
+        # An --index-only pass encodes nothing, so the shape has to come off the disk. Leaving it
+        # None once let the [48, 3, 16, 16] assertion skip silently on a full build.
+        with np.load(args.output / cached[0]["path"]) as payload:
+            latent_shape = list(payload["latents"].shape[1:])
     if not writes_index:
         print(
             f"shard {args.shard_index}/{args.shard_count}: {len(cached)}/{len(encodable)} episode(s) "
@@ -302,7 +316,7 @@ def main() -> None:
         "num_encodable_episodes": len(encodable),
         "num_cached_episodes": len(cached),
         "num_windows": sum(r["num_windows"] for r in cached),
-        "split_episode_counts": split_counts({r["episode_index"]: r["split"] for r in records}),
+        "split_episode_counts": split_counts(r["split"] for r in records),
         "suites": suites,
         "view": args.view,
         "window": args.window,

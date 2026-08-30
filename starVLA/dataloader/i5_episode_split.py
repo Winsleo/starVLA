@@ -79,9 +79,17 @@ def assign_splits(
     return assignment
 
 
-def split_counts(assignment: Mapping[int, str]) -> dict[str, int]:
-    """Episode count per split, for cache metadata and provenance."""
+def split_counts(names: Iterable[str]) -> dict[str, int]:
+    """Count per split, over an iterable of **split names**.
+
+    Takes names rather than an episode-to-split mapping on purpose. The first version took a mapping
+    and the cache builder fed it one keyed by `episode_index` -- but LeRobot restarts episode
+    indices at 0 in every suite, so entries collided and the reported totals collapsed from 1693
+    episodes to the 454 distinct indices. Counting names cannot express that bug.
+    """
     counts = {name: 0 for name in SPLITS}
-    for name in assignment.values():
+    for name in names:
+        if name not in counts:
+            raise ValueError(f"unknown split {name!r}; expected one of {SPLITS}")
         counts[name] += 1
     return counts
