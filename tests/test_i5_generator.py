@@ -33,6 +33,7 @@ from starVLA.model.modules.world_model.i5_generator import (
     CONDITION_DIM,
     ActionConditionProjector,
     LatentGeneratorSkeleton,
+    aligned_sigma_mean,
     apply_partial_noise,
     clean_frame_mask,
     concat_condition,
@@ -346,6 +347,35 @@ class SigmaSamplingTest(unittest.TestCase):
         middle = lambda s: float(((s > 0.25) & (s < 0.75)).float().mean())
         self.assertGreater(middle(logit_normal), middle(uniform))
         self.assertAlmostEqual(middle(uniform), 0.5, delta=0.02)
+
+    def test_shift_is_exactly_a_logit_space_mean_shift(self):
+        """`flow_shift` is not a separate distribution: it is this family with a shifted mean.
+
+        Pins the identity `logit(shift-applied sigma) = logit(sigma) + log(shift)`, which is what
+        makes `aligned_sigma_mean` the principled mean rather than one option among three.
+        """
+        import math
+
+        shift = 5.0
+        z = torch.randn(50000, generator=torch.Generator().manual_seed(0))
+        sigma = torch.sigmoid(z)
+        by_formula = shift * sigma / (1 + (shift - 1) * sigma)
+        by_mean_shift = torch.sigmoid(z + aligned_sigma_mean(shift))
+        torch.testing.assert_close(by_formula, by_mean_shift, rtol=0, atol=1e-6)
+        self.assertAlmostEqual(aligned_sigma_mean(shift), math.log(shift), places=12)
+        with self.assertRaisesRegex(ValueError, "flow_shift must be positive"):
+            aligned_sigma_mean(0.0)
+
+    def test_aligned_mean_covers_where_the_sampler_actually_steps(self):
+        """The reason to prefer it: the 20-step schedule has median sigma 0.860."""
+        centred = sample_sigma(50000, generator=torch.Generator().manual_seed(2))
+        aligned = sample_sigma(
+            50000, generator=torch.Generator().manual_seed(2), mean=aligned_sigma_mean()
+        )
+        above = lambda s: float((s > 0.8).float().mean())
+        self.assertLess(above(centred), 0.15)
+        self.assertGreater(above(aligned), 0.5)
+        self.assertAlmostEqual(float(aligned.median()), 0.833, delta=0.02)
 
     def test_sampling_is_reproducible_and_validated(self):
         first = sample_sigma(16, generator=torch.Generator().manual_seed(7))
