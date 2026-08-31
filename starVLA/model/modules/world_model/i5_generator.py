@@ -162,8 +162,8 @@ def apply_partial_noise(
     where it is the clean conditioning context -- the conditioning frame must stay bit-identical to
     the encoder output, otherwise the model is conditioned on something the tokenizer never emits.
 
-    The velocity target that pairs with this interpolation is deferred to S3, where it can be checked
-    against the scheduler rather than assumed.
+    The velocity target that pairs with this interpolation is :func:`flow_velocity_target`, verified
+    against the real scheduler rather than assumed -- see that function's notes.
     """
     if latents.shape != noise.shape:
         raise ValueError(f"noise shape {tuple(noise.shape)} != latents {tuple(latents.shape)}")
@@ -174,6 +174,51 @@ def apply_partial_noise(
     scale = sigma.view(-1, 1, 1, 1, 1).to(latents.dtype)
     noisy = (1.0 - scale) * latents + scale * noise
     return torch.where(keep, latents, noisy)
+
+
+#: Wan 2.2's `num_train_timesteps`, from its scheduler config.
+FLOW_NUM_TRAIN_TIMESTEPS = 1000
+
+
+def flow_velocity_target(latents: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+    """The flow-matching target that pairs with :func:`apply_partial_noise`: `noise - latents`.
+
+    Not a convention taken on faith. Read off the pinned scheduler and then checked numerically:
+
+    * `UniPCMultistepScheduler.convert_model_output` under `prediction_type="flow_prediction"`
+      computes `x0 = sample - sigma * model_output`
+      (`scheduling_unipc_multistep.py`, the `flow_prediction` branch);
+    * so with `x_sigma = (1 - sigma) * x0 + sigma * noise`, consistency forces
+      `v = noise - x0`;
+    * feeding exactly that `v` back through the real scheduler recovers `x0` to float32 epsilon
+      (max absolute error 2e-7 to 5e-7 across sigmas 0.63 to 1.0), while the opposite sign
+      `x0 - noise` is off by 9.0 -- so the check is not vacuous.
+
+    `tests/test_i5_generator.py` pins both directions against the real scheduler.
+    """
+    if latents.shape != noise.shape:
+        raise ValueError(f"noise shape {tuple(noise.shape)} != latents {tuple(latents.shape)}")
+    return noise - latents
+
+
+def timestep_from_sigma(
+    sigma: torch.Tensor, num_train_timesteps: int = FLOW_NUM_TRAIN_TIMESTEPS
+) -> torch.Tensor:
+    """`floor(sigma * num_train_timesteps)` as int64, matching the scheduler's own mapping.
+
+    `set_timesteps` computes `timesteps = sigmas * num_train_timesteps` and stores them as int64, so
+    the relation holds up to that truncation (verified: it equals `floor(sigma * 1000)` exactly, and
+    the residual is below one timestep). The training loop has to use the same mapping, otherwise the
+    per-token timestep the DiT sees disagrees with the sigma the latents were noised at.
+
+    **Still open for S3**: the *training-time* distribution of sigma is not determined by the
+    scheduler. `flow_shift=5.0` shapes the inference schedule, not the training sampler, and whether
+    Wan trained with uniform sigma, a logit-normal in `u`, or a shifted distribution cannot be read
+    off the config. That choice is an engineering default and must be recorded as one.
+    """
+    if not torch.is_floating_point(sigma):
+        raise ValueError(f"sigma must be floating point, got {sigma.dtype}")
+    return torch.floor(sigma.double() * num_train_timesteps).to(torch.long)
 
 
 class LatentGeneratorSkeleton(nn.Module):

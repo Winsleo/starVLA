@@ -21,6 +21,7 @@ condition sequence, so a change in that sequence is observable in the output.
 
 from __future__ import annotations
 
+import os
 import unittest
 
 import torch
@@ -35,7 +36,9 @@ from starVLA.model.modules.world_model.i5_generator import (
     apply_partial_noise,
     clean_frame_mask,
     concat_condition,
+    flow_velocity_target,
     segmented_timesteps,
+    timestep_from_sigma,
     token_grid,
 )
 
@@ -242,6 +245,86 @@ class GeneratorSkeletonTest(unittest.TestCase):
         source = inspect.getsource(VLA_JEPA)
         for name in ("i5_generator", "LatentGeneratorSkeleton", "ActionConditionProjector"):
             self.assertNotIn(name, source, f"the Fast Policy framework references {name}")
+
+
+#: The pinned Wan 2.2 scheduler config, inline so this test needs no download. The on-disk config is
+#: cross-checked against these values when it is present.
+SCHEDULER_CONFIG = dict(
+    num_train_timesteps=1000,
+    prediction_type="flow_prediction",
+    use_flow_sigmas=True,
+    flow_shift=5.0,
+    predict_x0=True,
+    solver_order=2,
+    solver_type="bh2",
+    final_sigmas_type="zero",
+)
+
+
+class FlowConventionTest(unittest.TestCase):
+    """Pin the noising and target convention against the real scheduler.
+
+    This is the piece S2 deliberately did not hardcode: getting the sign or the interpolation wrong
+    would train the generator against a target the sampler cannot integrate, and the failure would
+    look like "it just does not learn" rather than like a bug.
+    """
+
+    def _scheduler(self):
+        from diffusers import UniPCMultistepScheduler
+
+        scheduler = UniPCMultistepScheduler(**SCHEDULER_CONFIG)
+        scheduler.set_timesteps(num_inference_steps=8)
+        return scheduler
+
+    def test_velocity_target_lets_the_scheduler_recover_the_clean_latents(self):
+        scheduler = self._scheduler()
+        torch.manual_seed(0)
+        latents = torch.randn(1, LATENT[0], 3, 4, 4)
+        noise = torch.randn_like(latents)
+        for index in (0, 3, 6):
+            sigma = scheduler.sigmas[index]
+            noisy = (1 - sigma) * latents + sigma * noise
+            scheduler._step_index = index
+            recovered = scheduler.convert_model_output(
+                flow_velocity_target(latents, noise), sample=noisy
+            )
+            torch.testing.assert_close(recovered, latents, rtol=0, atol=1e-5)
+
+    def test_the_opposite_sign_does_not_recover_them(self):
+        """Without this the test above could pass for a target that happens to be near zero."""
+        scheduler = self._scheduler()
+        torch.manual_seed(0)
+        latents = torch.randn(1, LATENT[0], 3, 4, 4)
+        noise = torch.randn_like(latents)
+        sigma = scheduler.sigmas[3]
+        noisy = (1 - sigma) * latents + sigma * noise
+        scheduler._step_index = 3
+        wrong = scheduler.convert_model_output(latents - noise, sample=noisy)
+        self.assertGreater((wrong - latents).abs().max().item(), 1.0)
+
+    def test_timestep_mapping_matches_the_scheduler(self):
+        scheduler = self._scheduler()
+        sigmas = scheduler.sigmas[: len(scheduler.timesteps)]
+        self.assertTrue(torch.equal(timestep_from_sigma(sigmas), scheduler.timesteps.long()))
+
+    def test_timestep_mapping_rejects_an_integer_sigma(self):
+        with self.assertRaisesRegex(ValueError, "floating point"):
+            timestep_from_sigma(torch.tensor([1]))
+
+    def test_velocity_target_shape_is_checked(self):
+        with self.assertRaisesRegex(ValueError, "noise shape"):
+            flow_velocity_target(torch.zeros(1, 2, 3, 4, 4), torch.zeros(1, 2, 3, 4, 5))
+
+    @unittest.skipUnless(
+        os.path.isdir(os.environ.get("I5_WAN_SCHEDULER_PATH", "")),
+        "set I5_WAN_SCHEDULER_PATH to cross-check the on-disk scheduler config",
+    )
+    def test_on_disk_config_matches_the_inline_one(self):
+        from diffusers import UniPCMultistepScheduler
+
+        on_disk = UniPCMultistepScheduler.from_pretrained(os.environ["I5_WAN_SCHEDULER_PATH"])
+        for key, value in SCHEDULER_CONFIG.items():
+            self.assertEqual(on_disk.config[key], value, f"{key} disagrees with the pinned config")
 
 
 def _real_dit(**overrides):
