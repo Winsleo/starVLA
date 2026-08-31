@@ -36,7 +36,9 @@ from starVLA.model.modules.world_model.i5_generator import (
     apply_partial_noise,
     clean_frame_mask,
     concat_condition,
+    flow_matching_loss,
     flow_velocity_target,
+    sample_sigma,
     segmented_timesteps,
     timestep_from_sigma,
     token_grid,
@@ -325,6 +327,62 @@ class FlowConventionTest(unittest.TestCase):
         on_disk = UniPCMultistepScheduler.from_pretrained(os.environ["I5_WAN_SCHEDULER_PATH"])
         for key, value in SCHEDULER_CONFIG.items():
             self.assertEqual(on_disk.config[key], value, f"{key} disagrees with the pinned config")
+
+
+class SigmaSamplingTest(unittest.TestCase):
+    def test_logit_normal_is_bounded_and_centred(self):
+        sigma = sample_sigma(20000, generator=torch.Generator().manual_seed(0))
+        self.assertEqual(tuple(sigma.shape), (20000,))
+        self.assertGreater(float(sigma.min()), 0.0)
+        self.assertLess(float(sigma.max()), 1.0)
+        # sigmoid of a standard normal is symmetric about 0.5.
+        self.assertAlmostEqual(float(sigma.mean()), 0.5, delta=0.01)
+
+    def test_logit_normal_concentrates_more_than_uniform(self):
+        """The reason D-066 picked it: budget lands in the middle of the range, not at the ends."""
+        seed = torch.Generator().manual_seed(1)
+        logit_normal = sample_sigma(20000, generator=seed)
+        uniform = sample_sigma(20000, distribution="uniform", generator=torch.Generator().manual_seed(1))
+        middle = lambda s: float(((s > 0.25) & (s < 0.75)).float().mean())
+        self.assertGreater(middle(logit_normal), middle(uniform))
+        self.assertAlmostEqual(middle(uniform), 0.5, delta=0.02)
+
+    def test_sampling_is_reproducible_and_validated(self):
+        first = sample_sigma(16, generator=torch.Generator().manual_seed(7))
+        second = sample_sigma(16, generator=torch.Generator().manual_seed(7))
+        self.assertTrue(torch.equal(first, second))
+        with self.assertRaisesRegex(ValueError, "unknown sigma distribution"):
+            sample_sigma(4, distribution="beta")
+
+
+class FlowLossTest(unittest.TestCase):
+    def test_loss_ignores_the_clean_conditioning_frame(self):
+        """Scoring the handed-over frame would reward copying an unnoised input."""
+        torch.manual_seed(0)
+        latents, noise = _latents(), _latents(seed=9)
+        target = flow_velocity_target(latents, noise)
+        prediction = target.clone()
+        # Make the clean frame's prediction arbitrarily wrong: the loss must not notice.
+        prediction[:, :, 0] += 100.0
+        loss, _ = flow_matching_loss(prediction, latents, noise)
+        self.assertAlmostEqual(float(loss), 0.0, places=6)
+        # And a wrong future frame must be noticed, so the check above is not vacuous.
+        prediction[:, :, 1] += 3.0
+        worse, _ = flow_matching_loss(prediction, latents, noise)
+        self.assertGreater(float(worse), 1.0)
+
+    def test_loss_returns_unreduced_error_for_per_frame_logging(self):
+        latents, noise = _latents(), _latents(seed=9)
+        loss, squared = flow_matching_loss(flow_velocity_target(latents, noise) + 1.0, latents, noise)
+        self.assertEqual(squared.shape, latents.shape)
+        self.assertAlmostEqual(float(loss), 1.0, places=5)
+        # Per-frame breakdown is available, including for the excluded frame.
+        self.assertEqual(tuple(squared.mean(dim=(0, 1, 3, 4)).shape), (LATENT[1],))
+
+    def test_shape_mismatch_is_rejected(self):
+        latents, noise = _latents(), _latents(seed=9)
+        with self.assertRaisesRegex(ValueError, "prediction shape"):
+            flow_matching_loss(torch.zeros(2, 48, 3, 8, 8), latents, noise)
 
 
 def _real_dit(**overrides):

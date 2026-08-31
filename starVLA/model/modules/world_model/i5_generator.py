@@ -221,6 +221,62 @@ def timestep_from_sigma(
     return torch.floor(sigma.double() * num_train_timesteps).to(torch.long)
 
 
+def sample_sigma(
+    batch_size: int,
+    *,
+    distribution: str = "logit_normal",
+    generator: torch.Generator | None = None,
+    device: torch.device | str = "cpu",
+    mean: float = 0.0,
+    std: float = 1.0,
+) -> torch.Tensor:
+    """Training-time sigma, `[B]` in (0, 1).
+
+    `logit_normal` is `sigmoid(z)` with `z ~ N(mean, std)`: the de-facto standard for flow-matching
+    training (the SD3/Flux line), concentrating samples in the middle of the sigma range instead of
+    spending budget at the ends. `uniform` is the cheap control.
+
+    **This distribution is our choice, not Wan's recipe** (D-066). The pinned scheduler fixes the
+    interpolation, the target and the timestep mapping -- all three verified -- but says nothing about
+    how sigma is drawn during training: `flow_shift` shapes the inference schedule. Recorded as an
+    engineering default so it stays replaceable.
+    """
+    if distribution == "logit_normal":
+        z = torch.randn(batch_size, generator=generator, device=device)
+        return torch.sigmoid(z * std + mean)
+    if distribution == "uniform":
+        return torch.rand(batch_size, generator=generator, device=device)
+    raise ValueError(f"unknown sigma distribution {distribution!r}; expected logit_normal or uniform")
+
+
+def flow_matching_loss(
+    prediction: torch.Tensor,
+    latents: torch.Tensor,
+    noise: torch.Tensor,
+    *,
+    num_clean_frames: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Masked flow-matching loss, returning `(raw_loss, per_element_squared_error)`.
+
+    The loss is computed **only on the frames the model was asked to predict**. Including the clean
+    conditioning frame would reward copying an input the model was handed unnoised, which would both
+    depress the loss and hide whether anything was learned.
+
+    Returns the raw mean alongside the unreduced squared error so a caller can log raw and weighted
+    values separately, and can break the error down per latent frame -- both required by
+    `AGENTS.md` section 10.
+    """
+    target = flow_velocity_target(latents, noise)
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"prediction shape {tuple(prediction.shape)} != target {tuple(target.shape)}"
+        )
+    predicted_frames = ~clean_frame_mask(latents.shape[2], num_clean_frames).to(latents.device)
+    squared_error = (prediction.float() - target.float()) ** 2
+    masked = squared_error[:, :, predicted_frames]
+    return masked.mean(), squared_error
+
+
 class LatentGeneratorSkeleton(nn.Module):
     """Frozen-tokenizer-side generator: a DiT plus the condition projector, wired but untrained.
 
