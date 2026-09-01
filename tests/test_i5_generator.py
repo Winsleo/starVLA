@@ -34,12 +34,14 @@ from starVLA.model.modules.world_model.i5_generator import (
     ActionConditionProjector,
     LatentGeneratorSkeleton,
     aligned_sigma_mean,
+    bell_timestep_weights,
     apply_partial_noise,
     clean_frame_mask,
     concat_condition,
     flow_matching_loss,
     flow_velocity_target,
     sample_sigma,
+    wan_training_sigmas,
     segmented_timesteps,
     timestep_from_sigma,
     token_grid,
@@ -331,8 +333,18 @@ class FlowConventionTest(unittest.TestCase):
 
 
 class SigmaSamplingTest(unittest.TestCase):
-    def test_logit_normal_is_bounded_and_centred(self):
+    def test_default_is_the_endorsed_shifted_grid(self):
+        """D-067: the default draws from the shifted grid, not from a distribution we invented."""
         sigma = sample_sigma(20000, generator=torch.Generator().manual_seed(0))
+        grid = wan_training_sigmas()
+        self.assertTrue(bool(torch.isin(sigma, grid).all()), "samples must land on the shifted grid")
+        self.assertAlmostEqual(float(sigma.median()), 0.834, delta=0.02)
+        self.assertGreater(float((sigma > 0.8).float().mean()), 0.5)
+
+    def test_logit_normal_is_bounded_and_centred(self):
+        sigma = sample_sigma(
+            20000, distribution="logit_normal", generator=torch.Generator().manual_seed(0)
+        )
         self.assertEqual(tuple(sigma.shape), (20000,))
         self.assertGreater(float(sigma.min()), 0.0)
         self.assertLess(float(sigma.max()), 1.0)
@@ -342,7 +354,7 @@ class SigmaSamplingTest(unittest.TestCase):
     def test_logit_normal_concentrates_more_than_uniform(self):
         """The reason D-066 picked it: budget lands in the middle of the range, not at the ends."""
         seed = torch.Generator().manual_seed(1)
-        logit_normal = sample_sigma(20000, generator=seed)
+        logit_normal = sample_sigma(20000, distribution="logit_normal", generator=seed)
         uniform = sample_sigma(20000, distribution="uniform", generator=torch.Generator().manual_seed(1))
         middle = lambda s: float(((s > 0.25) & (s < 0.75)).float().mean())
         self.assertGreater(middle(logit_normal), middle(uniform))
@@ -368,14 +380,45 @@ class SigmaSamplingTest(unittest.TestCase):
 
     def test_aligned_mean_covers_where_the_sampler_actually_steps(self):
         """The reason to prefer it: the 20-step schedule has median sigma 0.860."""
-        centred = sample_sigma(50000, generator=torch.Generator().manual_seed(2))
+        centred = sample_sigma(
+            50000, distribution="logit_normal", generator=torch.Generator().manual_seed(2)
+        )
         aligned = sample_sigma(
-            50000, generator=torch.Generator().manual_seed(2), mean=aligned_sigma_mean()
+            50000,
+            distribution="logit_normal",
+            generator=torch.Generator().manual_seed(2),
+            mean=aligned_sigma_mean(),
         )
         above = lambda s: float((s > 0.8).float().mean())
         self.assertLess(above(centred), 0.15)
         self.assertGreater(above(aligned), 0.5)
         self.assertAlmostEqual(float(aligned.median()), 0.833, delta=0.02)
+
+    def test_shifted_sampling_matches_the_aligned_logit_normal(self):
+        """Why "shifted" was never a third family: the two densities nearly coincide."""
+        shifted = sample_sigma(50000, generator=torch.Generator().manual_seed(3))
+        aligned = sample_sigma(
+            50000,
+            distribution="logit_normal",
+            generator=torch.Generator().manual_seed(3),
+            mean=aligned_sigma_mean(),
+        )
+        self.assertAlmostEqual(float(shifted.median()), float(aligned.median()), delta=0.02)
+
+    def test_bell_weight_pulls_the_effective_mass_back_down(self):
+        """The half of the recipe that must not be dropped (D-067)."""
+        grid = wan_training_sigmas()
+        weights = bell_timestep_weights(grid)
+        self.assertAlmostEqual(float(weights.mean()), 1.0, places=4)
+        self.assertGreaterEqual(float(weights.min()), 0.0)
+        sampling = torch.full_like(grid, 1.0 / grid.numel())
+        effective = sampling * weights
+        effective = effective / effective.sum()
+        high_sampling = float(sampling[grid > 0.8].sum())
+        high_effective = float(effective[grid > 0.8].sum())
+        self.assertAlmostEqual(high_sampling, 0.556, delta=0.02)
+        self.assertAlmostEqual(high_effective, 0.280, delta=0.02)
+        self.assertLess(high_effective, high_sampling)
 
     def test_sampling_is_reproducible_and_validated(self):
         first = sample_sigma(16, generator=torch.Generator().manual_seed(7))
@@ -394,25 +437,95 @@ class FlowLossTest(unittest.TestCase):
         prediction = target.clone()
         # Make the clean frame's prediction arbitrarily wrong: the loss must not notice.
         prediction[:, :, 0] += 100.0
-        loss, _ = flow_matching_loss(prediction, latents, noise)
+        loss, _, _ = flow_matching_loss(prediction, latents, noise)
         self.assertAlmostEqual(float(loss), 0.0, places=6)
         # And a wrong future frame must be noticed, so the check above is not vacuous.
         prediction[:, :, 1] += 3.0
-        worse, _ = flow_matching_loss(prediction, latents, noise)
+        worse, _, _ = flow_matching_loss(prediction, latents, noise)
         self.assertGreater(float(worse), 1.0)
 
     def test_loss_returns_unreduced_error_for_per_frame_logging(self):
         latents, noise = _latents(), _latents(seed=9)
-        loss, squared = flow_matching_loss(flow_velocity_target(latents, noise) + 1.0, latents, noise)
+        loss, _, squared = flow_matching_loss(
+            flow_velocity_target(latents, noise) + 1.0, latents, noise
+        )
         self.assertEqual(squared.shape, latents.shape)
         self.assertAlmostEqual(float(loss), 1.0, places=5)
         # Per-frame breakdown is available, including for the excluded frame.
         self.assertEqual(tuple(squared.mean(dim=(0, 1, 3, 4)).shape), (LATENT[1],))
 
+    def test_raw_and_weighted_are_returned_separately(self):
+        """AGENTS section 10 wants both; a weighted loss alone is not comparable across sigmas."""
+        latents, noise = _latents(), _latents(seed=9)
+        prediction = flow_velocity_target(latents, noise) + 1.0
+        raw, weighted, _ = flow_matching_loss(
+            prediction, latents, noise, weight=torch.tensor([0.5, 1.5])
+        )
+        self.assertAlmostEqual(float(raw), 1.0, places=5)
+        self.assertAlmostEqual(float(weighted), 1.0, places=5)
+        raw2, weighted2, _ = flow_matching_loss(
+            prediction, latents, noise, weight=torch.tensor([0.25, 0.25])
+        )
+        self.assertAlmostEqual(float(raw2), 1.0, places=5)
+        self.assertAlmostEqual(float(weighted2), 0.25, places=5)
+        with self.assertRaisesRegex(ValueError, "one weight per batch element"):
+            flow_matching_loss(prediction, latents, noise, weight=torch.tensor([1.0]))
+
     def test_shape_mismatch_is_rejected(self):
         latents, noise = _latents(), _latents(seed=9)
         with self.assertRaisesRegex(ValueError, "prediction shape"):
             flow_matching_loss(torch.zeros(2, 48, 3, 8, 8), latents, noise)
+
+
+#: Set to a DiffSynth-Studio checkout to compare the recipe against its source implementation.
+DIFFSYNTH_PATH = os.environ.get("I5_DIFFSYNTH_PATH")
+
+
+@unittest.skipUnless(
+    DIFFSYNTH_PATH and os.path.isfile(
+        os.path.join(DIFFSYNTH_PATH, "diffsynth/diffusion/flow_match.py")
+    ),
+    "set I5_DIFFSYNTH_PATH to compare against DiffSynth's own scheduler",
+)
+class DiffSynthRecipeParityTest(unittest.TestCase):
+    """Our reimplementation against the source it was adopted from (D-067).
+
+    Wan 2.2's own README points at DiffSynth-Studio for training, so this is the endorsed recipe and
+    the reimplementation has to match it exactly rather than approximately. The module is loaded by
+    file path, not imported as a package: importing `diffsynth` pulls in deepspeed, which wants nvcc.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "ds_flow_match", os.path.join(DIFFSYNTH_PATH, "diffsynth/diffusion/flow_match.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        scheduler = module.FlowMatchScheduler()
+        scheduler.set_timesteps_fn = module.FlowMatchScheduler.set_timesteps_wan
+        scheduler.num_train_timesteps = 1000
+        scheduler.set_timesteps(1000, training=True)
+        cls.scheduler = scheduler
+
+    def test_sigma_grid_is_bit_identical(self):
+        self.assertTrue(torch.equal(self.scheduler.sigmas, wan_training_sigmas()))
+
+    def test_loss_weights_are_bit_identical(self):
+        ours = bell_timestep_weights(wan_training_sigmas())
+        self.assertTrue(torch.equal(self.scheduler.linear_timesteps_weights, ours))
+
+    def test_velocity_target_agrees(self):
+        sample = torch.randn(2, 4)
+        noise = torch.randn_like(sample)
+        self.assertTrue(
+            torch.equal(
+                self.scheduler.training_target(sample, noise, None),
+                flow_velocity_target(sample, noise),
+            )
+        )
 
 
 def _real_dit(**overrides):

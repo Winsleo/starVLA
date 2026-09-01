@@ -242,32 +242,80 @@ def aligned_sigma_mean(flow_shift: float = 5.0) -> float:
     return math.log(flow_shift)
 
 
+def wan_training_sigmas(
+    num_steps: int = FLOW_NUM_TRAIN_TIMESTEPS, flow_shift: float = 5.0
+) -> torch.Tensor:
+    """The shifted sigma grid a Wan training run draws from, `[num_steps]` descending from 1.
+
+    Reproduces `FlowMatchScheduler.set_timesteps_wan` in DiffSynth-Studio: a uniform grid on
+    `[1, 0)` put through the same shift the inference schedule uses. Wan 2.2's own README points at
+    DiffSynth for training, so this is the endorsed recipe rather than a guess (D-067).
+    """
+    if num_steps < 2:
+        raise ValueError(f"num_steps must be >= 2, got {num_steps}")
+    if flow_shift <= 0:
+        raise ValueError(f"flow_shift must be positive, got {flow_shift}")
+    raw = torch.linspace(1.0, 0.0, num_steps + 1)[:-1]
+    return flow_shift * raw / (1 + (flow_shift - 1) * raw)
+
+
+def bell_timestep_weights(
+    sigmas: torch.Tensor, num_train_timesteps: int = FLOW_NUM_TRAIN_TIMESTEPS
+) -> torch.Tensor:
+    """Per-sigma loss weight, reproducing DiffSynth's `set_training_weight`.
+
+    A Gaussian bump on the timestep axis centred at `num_train_timesteps / 2`, min-subtracted and
+    normalised so the weights average to 1. It **counteracts** the shift: the shifted grid puts most
+    samples at high sigma (median 0.834), and this weight pulls the effective emphasis back to a
+    median of 0.677. Taking the sampling without the weight would train noticeably higher on the
+    sigma axis than the recipe that was actually validated -- 0.556 of the effective mass above
+    sigma 0.8 instead of 0.280 -- so the two travel together (D-067).
+
+    Upstream calls the shape "an empirical formula"; it is adopted as a validated pair, not because
+    its form is derived from anything.
+    """
+    steps = float(num_train_timesteps)
+    timesteps = sigmas * steps
+    bump = torch.exp(-2 * ((timesteps - steps / 2) / steps) ** 2)
+    shifted = bump - bump.min()
+    return shifted * (steps / shifted.sum())
+
+
 def sample_sigma(
     batch_size: int,
     *,
-    distribution: str = "logit_normal",
+    distribution: str = "shifted_uniform",
     generator: torch.Generator | None = None,
     device: torch.device | str = "cpu",
     mean: float = 0.0,
     std: float = 1.0,
+    flow_shift: float = 5.0,
+    num_steps: int = FLOW_NUM_TRAIN_TIMESTEPS,
 ) -> torch.Tensor:
-    """Training-time sigma, `[B]` in (0, 1).
+    """Training-time sigma, `[B]`.
 
-    `logit_normal` is `sigmoid(z)` with `z ~ N(mean, std)`: the de-facto standard for flow-matching
-    training (the SD3/Flux line), concentrating samples in the middle of the sigma range instead of
-    spending budget at the ends. `uniform` is the cheap control.
+    `shifted_uniform` is the default and is the endorsed recipe (D-067): draw an index uniformly from
+    the shifted grid, exactly as DiffSynth's training loop does. Numerically its density is nearly
+    the same as `logit_normal` with `mean = log(flow_shift)` (medians 0.834 and 0.833), which is why
+    "shifted" was never a separate distribution family -- see :func:`aligned_sigma_mean`.
 
-    **This distribution is our choice, not Wan's recipe** (D-066). The pinned scheduler fixes the
-    interpolation, the target and the timestep mapping -- all three verified -- but says nothing about
-    how sigma is drawn during training: `flow_shift` shapes the inference schedule. Recorded as an
-    engineering default so it stays replaceable.
+    `logit_normal` and `uniform` remain available as controls. What the *pretraining* used is still
+    not public; the pinned scheduler fixes the interpolation, the target and the timestep mapping,
+    but not the sampler.
     """
+    if distribution == "shifted_uniform":
+        grid = wan_training_sigmas(num_steps, flow_shift).to(device)
+        index = torch.randint(0, grid.numel(), (batch_size,), generator=generator, device=device)
+        return grid[index]
     if distribution == "logit_normal":
         z = torch.randn(batch_size, generator=generator, device=device)
         return torch.sigmoid(z * std + mean)
     if distribution == "uniform":
         return torch.rand(batch_size, generator=generator, device=device)
-    raise ValueError(f"unknown sigma distribution {distribution!r}; expected logit_normal or uniform")
+    raise ValueError(
+        f"unknown sigma distribution {distribution!r}; "
+        "expected shifted_uniform, logit_normal or uniform"
+    )
 
 
 def flow_matching_loss(
@@ -276,16 +324,18 @@ def flow_matching_loss(
     noise: torch.Tensor,
     *,
     num_clean_frames: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Masked flow-matching loss, returning `(raw_loss, per_element_squared_error)`.
+    weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Masked flow-matching loss: `(raw_loss, weighted_loss, per_element_squared_error)`.
 
-    The loss is computed **only on the frames the model was asked to predict**. Including the clean
-    conditioning frame would reward copying an input the model was handed unnoised, which would both
-    depress the loss and hide whether anything was learned.
+    The loss covers **only the frames the model was asked to predict**. Including the clean
+    conditioning frame would reward copying an input it was handed unnoised, which would both depress
+    the loss and hide whether anything was learned.
 
-    Returns the raw mean alongside the unreduced squared error so a caller can log raw and weighted
-    values separately, and can break the error down per latent frame -- both required by
-    `AGENTS.md` section 10.
+    `weight` is the per-sample timestep weight from :func:`bell_timestep_weights`. Raw and weighted
+    come back separately because `AGENTS.md` section 10 requires both to be logged, and because a
+    weighted loss alone cannot be compared across sigma distributions. The unreduced squared error is
+    returned too, so the error can be broken down per latent frame.
     """
     target = flow_velocity_target(latents, noise)
     if prediction.shape != target.shape:
@@ -295,7 +345,14 @@ def flow_matching_loss(
     predicted_frames = ~clean_frame_mask(latents.shape[2], num_clean_frames).to(latents.device)
     squared_error = (prediction.float() - target.float()) ** 2
     masked = squared_error[:, :, predicted_frames]
-    return masked.mean(), squared_error
+    raw = masked.mean()
+    if weight is None:
+        return raw, raw, squared_error
+    if weight.shape != (latents.shape[0],):
+        raise ValueError(f"expected one weight per batch element, got {tuple(weight.shape)}")
+    per_sample = masked.flatten(1).mean(dim=1)
+    weighted = (per_sample * weight.to(per_sample.dtype)).mean()
+    return raw, weighted, squared_error
 
 
 class LatentGeneratorSkeleton(nn.Module):
