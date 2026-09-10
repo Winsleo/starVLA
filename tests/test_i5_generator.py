@@ -480,6 +480,26 @@ class FlowLossTest(unittest.TestCase):
 #: Set to a DiffSynth-Studio checkout to compare the recipe against its source implementation.
 DIFFSYNTH_PATH = os.environ.get("I5_DIFFSYNTH_PATH")
 
+#: Git blob hashes of the two upstream files D-067's recipe was verified against, from
+#: `modelscope/DiffSynth-Studio`. Pinned by content, not by checkout: the copy on this machine is
+#: another project's working tree and can move, while a blob hash is reproducible from upstream.
+DIFFSYNTH_PINNED_BLOBS = {
+    "diffsynth/diffusion/flow_match.py": "b9104e869ec37cb0ac77ac095deb704013f2c1ca",
+    "diffsynth/diffusion/loss.py": "09388cad8b2ec3f8194ffd13163fdcafd79ce2f1",
+}
+
+
+def _git_blob_hash(path: str) -> str:
+    """Git's object id for a file's contents: sha1 of "blob <len>\0" plus the bytes.
+
+    Computed directly so the check does not need git, and so it pins the *content* rather than
+    whatever revision a local checkout happens to be on.
+    """
+    import hashlib
+
+    data = open(path, "rb").read()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
 
 @unittest.skipUnless(
     DIFFSYNTH_PATH and os.path.isfile(
@@ -494,6 +514,17 @@ class DiffSynthRecipeParityTest(unittest.TestCase):
     the reimplementation has to match it exactly rather than approximately. The module is loaded by
     file path, not imported as a package: importing `diffsynth` pulls in deepspeed, which wants nvcc.
     """
+
+    def test_source_files_are_the_pinned_revision(self):
+        """Parity against a moving target proves nothing, so pin what we compared to."""
+        for relative, expected in DIFFSYNTH_PINNED_BLOBS.items():
+            actual = _git_blob_hash(os.path.join(DIFFSYNTH_PATH, relative))
+            self.assertEqual(
+                actual,
+                expected,
+                f"{relative} is not the content D-067 was verified against; re-run the "
+                "parity comparison and update the pin before trusting it",
+            )
 
     @classmethod
     def setUpClass(cls) -> None:

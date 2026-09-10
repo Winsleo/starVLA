@@ -40,6 +40,28 @@ PATCH = (1, 2, 2)
 LATENT_CHANNELS = 48
 NUM_LAYERS = 2
 
+#: The diffusers release the I5 conventions were read from and verified against. The flow target, the
+#: timestep mapping and the per-token timestep branch are all version-specific, so a silent upgrade
+#: would invalidate verifications without failing anything -- hence an explicit check.
+PINNED_DIFFUSERS_VERSION = "0.38.0"
+
+
+class PinnedDependencyTest(unittest.TestCase):
+    def test_diffusers_version_matches_the_one_the_conventions_were_verified_on(self):
+        import diffusers
+
+        self.assertEqual(
+            diffusers.__version__,
+            PINNED_DIFFUSERS_VERSION,
+            "the flow-matching conventions in D-067 were read from and verified against "
+            f"diffusers {PINNED_DIFFUSERS_VERSION}; re-verify before moving off it",
+        )
+
+    def test_peft_is_present_and_recorded(self):
+        import peft
+
+        self.assertEqual(peft.__version__, "0.19.1")
+
 
 def _dit(num_layers: int = NUM_LAYERS):
     from diffusers import WanTransformer3DModel
