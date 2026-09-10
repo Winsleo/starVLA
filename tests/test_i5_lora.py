@@ -40,9 +40,11 @@ PATCH = (1, 2, 2)
 LATENT_CHANNELS = 48
 NUM_LAYERS = 2
 
-#: diffusers releases the I5 conventions have been verified against. Membership, not equality: I5 runs
-#: in two environments on purpose -- the pinned one (0.38.0, where the caches and the policy live) and
-#: a generator-only one (0.40.0). Adding a version here has to be a deliberate act, because the flow
+#: diffusers releases the I5 conventions have been *verified* against. Membership, not equality, and
+#: the distinction between verified and in-use matters: I5 runs on **0.38.0**, the pinned environment.
+#: 0.40.0 is in the set because a probe checked it and the whole I5 suite passed there, not because
+#: anything uses it -- see the diffusers upgrade probe in docs/provenance/environment.md, which
+#: concluded against adopting it. Adding a version here has to stay a deliberate act, since the flow
 #: target, the timestep mapping and the per-token timestep branch are all read out of this source.
 #:
 #: 0.40.0 was admitted after diffing the three files I5 depends on against 0.38.0:
