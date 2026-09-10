@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from starVLA.dataloader.i5_episode_split import (
+from starVLA.i5.episode_split import (
     SPLITS,
     TEST,
     TRAIN,
@@ -33,7 +33,7 @@ from starVLA.dataloader.i5_episode_split import (
     assign_splits,
     split_counts,
 )
-from starVLA.model.modules.world_model.latent_tokenizer import (
+from starVLA.i5.latent_tokenizer import (
     I5_WINDOW_FRAMES,
     LATENT_CHANNELS,
     FrozenLatentTokenizer,

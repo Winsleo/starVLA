@@ -3,8 +3,8 @@
 One `episode_*.npz` per episode, holding the normalised Wan 2.2 latents of every 9-frame window in
 that episode, plus an `index.json` recording the split assignment and everything needed to reproduce
 the cache. Orchestration only: the tensor contract lives in
-`starVLA/model/modules/world_model/latent_tokenizer.py` and the split in
-`starVLA/dataloader/i5_episode_split.py`, both unit-tested without weights.
+`starVLA/i5/latent_tokenizer.py` and the split in
+`starVLA/i5/episode_split.py`, both unit-tested without weights.
 
 Fixed by decision, not by flag default:
 
@@ -37,8 +37,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from starVLA.dataloader.i5_episode_split import assign_splits, split_counts
-from starVLA.model.modules.world_model.latent_tokenizer import (
+from starVLA.i5.episode_split import assign_splits, split_counts
+from starVLA.i5.latent_tokenizer import (
     I5_WINDOW_FRAMES,
     LATENT_CHANNELS,
     FrozenLatentTokenizer,

@@ -22,13 +22,13 @@ import unittest
 
 import torch
 
-from starVLA.model.modules.world_model.i5_generator import (
+from starVLA.i5.generator import (
     ACTION_DIM,
     ACTION_TOKENS,
     CONDITION_DIM,
     LatentGeneratorSkeleton,
 )
-from starVLA.model.modules.world_model.i5_lora import (
+from starVLA.i5.lora import (
     WAN_LORA_TARGETS,
     assert_only_expected_parameters_train,
     attach_lora,
@@ -40,21 +40,27 @@ PATCH = (1, 2, 2)
 LATENT_CHANNELS = 48
 NUM_LAYERS = 2
 
-#: The diffusers release the I5 conventions were read from and verified against. The flow target, the
-#: timestep mapping and the per-token timestep branch are all version-specific, so a silent upgrade
-#: would invalidate verifications without failing anything -- hence an explicit check.
-PINNED_DIFFUSERS_VERSION = "0.38.0"
+#: diffusers releases the I5 conventions have been verified against. Membership, not equality: I5 runs
+#: in two environments on purpose -- the pinned one (0.38.0, where the caches and the policy live) and
+#: a generator-only one (0.40.0). Adding a version here has to be a deliberate act, because the flow
+#: target, the timestep mapping and the per-token timestep branch are all read out of this source.
+#:
+#: 0.40.0 was admitted after diffing the three files I5 depends on against 0.38.0:
+#: `scheduling_unipc_multistep.py` is **identical** (0 lines), and in `transformer_wan.py` the only
+#: non-docstring change is one entry added to `_keep_in_fp32_modules`; the `temb.ndim == 4` branch and
+#: the hardcoded 512-token text split are unchanged.
+VERIFIED_DIFFUSERS_VERSIONS = frozenset({"0.38.0", "0.40.0"})
 
 
 class PinnedDependencyTest(unittest.TestCase):
-    def test_diffusers_version_matches_the_one_the_conventions_were_verified_on(self):
+    def test_diffusers_version_is_one_we_verified_the_conventions_on(self):
         import diffusers
 
-        self.assertEqual(
+        self.assertIn(
             diffusers.__version__,
-            PINNED_DIFFUSERS_VERSION,
-            "the flow-matching conventions in D-067 were read from and verified against "
-            f"diffusers {PINNED_DIFFUSERS_VERSION}; re-verify before moving off it",
+            VERIFIED_DIFFUSERS_VERSIONS,
+            f"diffusers {diffusers.__version__} has not been checked against D-067's conventions; "
+            "diff the scheduler and the Wan transformer against a verified version before adding it",
         )
 
     def test_peft_is_present_and_recorded(self):
